@@ -2,13 +2,14 @@ import os, asyncio
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.client.default import DefaultBotProperties
 import psycopg
 
 BOT_TOKEN    = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 TIMEZONE     = os.environ.get("TIMEZONE", "Europe/Moscow")
 
-bot = Bot(BOT_TOKEN, parse_mode="HTML")
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
 def kb(sid: int, is_booked: bool, free_left: int):
