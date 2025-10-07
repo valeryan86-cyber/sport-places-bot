@@ -4,8 +4,8 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.client.default import DefaultBotProperties
 import psycopg
-import sys
-import traceback
+import sys, traceback
+
 
 BOT_TOKEN    = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -13,6 +13,7 @@ TIMEZONE     = os.environ.get("TIMEZONE", "Europe/Moscow")
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
+
 
 def kb(sid: int, is_booked: bool, free_left: int):
     btns = []
@@ -23,15 +24,18 @@ def kb(sid: int, is_booked: bool, free_left: int):
         btns.append(InlineKeyboardButton(text="↩️ Отменить",   callback_data=f"cancel:{sid}"))
     return InlineKeyboardMarkup(inline_keyboard=[btns]) if btns else None
 
+
 async def q1(conn, sql, *args):
     async with conn.cursor() as cur:
         await cur.execute(sql, args)
         return await cur.fetchone()
 
+
 async def qn(conn, sql, *args):
     async with conn.cursor() as cur:
         await cur.execute(sql, args)
         return await cur.fetchall()
+
 
 async def ensure_user(conn, tg_id: int, name: str):
     row = await q1(conn, "SELECT id FROM tennis.users WHERE tg_id=%s", tg_id)
@@ -44,13 +48,16 @@ async def ensure_user(conn, tg_id: int, name: str):
     )
     return row[0]
 
+
 @dp.message(CommandStart())
 async def start(m: Message):
     await m.answer("Привет! Запись на теннис.\n• /week — расписание\n• /me — мои записи\n• /rules — правила")
 
+
 @dp.message(Command("rules"))
 async def rules(m: Message):
     await m.answer("Отмена без списания — не позднее чем за 12 часов до начала.")
+
 
 @dp.message(Command("week"))
 async def week(m: Message):
@@ -72,6 +79,7 @@ async def week(m: Message):
         lines.append(f"• #{sid} — {st:%a %d.%m %H:%M} (свободно: {free_left})")
     await m.answer("\n".join(lines))
 
+
 @dp.message(Command("me"))
 async def me(m: Message):
     async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
@@ -91,6 +99,7 @@ async def me(m: Message):
         lines.append(f"• booking {bid}: {st:%a %d.%m %H:%M} ({kind})")
     await m.answer("\n".join(lines))
 
+
 @dp.message(F.text.startswith("ses_"))
 async def open_by_code(m: Message):
     code = m.text[4:]
@@ -100,6 +109,7 @@ async def open_by_code(m: Message):
         await m.answer("Слот не найден.")
         return
     await open_session(m.from_user.id, m, None, row[0])
+
 
 async def open_session(tg_user_id: int, m: Message|None, c: CallbackQuery|None, sid: int):
     async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
@@ -123,6 +133,7 @@ async def open_session(tg_user_id: int, m: Message|None, c: CallbackQuery|None, 
     else:
         await c.message.edit_text(text, reply_markup=markup)
 
+
 @dp.callback_query(F.data.startswith("book:"))
 async def cb_book(c: CallbackQuery):
     _, sid, kind = c.data.split(":"); sid = int(sid)
@@ -135,6 +146,7 @@ async def cb_book(c: CallbackQuery):
             msg = str(e)
     await c.answer(msg, show_alert=(msg!="OK"))
     await open_session(c.from_user.id, None, c, sid)
+
 
 @dp.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(c: CallbackQuery):
@@ -153,20 +165,27 @@ async def cb_cancel(c: CallbackQuery):
     await open_session(c.from_user.id, None, c, sid)
 
 
-# ─── ДОБАВЛЕННЫЙ КОНЕЦ ──────────────────────────────────────────────
+# ─── НАДЁЖНЫЙ КОНЕЦ С KEEP-ALIVE ──────────────────────────────
+
 @dp.message(Command("ping"))
 async def ping(m: Message):
     await m.answer("pong")
 
+
 async def main():
     print(">>> Bot container started", flush=True)
     try:
+        print(">>> Starting polling...", flush=True)
         await dp.start_polling(bot)
-        print(">>> Bot polling started", flush=True)
     except Exception as e:
-        print(">>> Unhandled exception:", e, file=sys.stderr, flush=True)
+        print(">>> Unhandled exception in polling:", e, file=sys.stderr, flush=True)
         traceback.print_exc()
-        sys.exit(1)
+    finally:
+        # чтобы Railway не завершал контейнер, если polling остановился
+        print(">>> Polling stopped, keeping container alive...", flush=True)
+        while True:
+            await asyncio.sleep(3600)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
