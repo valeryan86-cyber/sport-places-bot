@@ -4,6 +4,8 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.client.default import DefaultBotProperties
 import psycopg
+import sys
+import traceback
 
 BOT_TOKEN    = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -150,8 +152,21 @@ async def cb_cancel(c: CallbackQuery):
     await c.answer(msg, show_alert=(msg!="OK"))
     await open_session(c.from_user.id, None, c, sid)
 
+
+# ─── ДОБАВЛЕННЫЙ КОНЕЦ ──────────────────────────────────────────────
+@dp.message(Command("ping"))
+async def ping(m: Message):
+    await m.answer("pong")
+
 async def main():
-    await dp.start_polling(bot)
+    print(">>> Bot container started", flush=True)
+    try:
+        await dp.start_polling(bot)
+        print(">>> Bot polling started", flush=True)
+    except Exception as e:
+        print(">>> Unhandled exception:", e, file=sys.stderr, flush=True)
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     asyncio.run(main())
