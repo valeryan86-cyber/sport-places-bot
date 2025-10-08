@@ -13,20 +13,17 @@ TIMEZONE  = os.environ.get("TIMEZONE", "Europe/Moscow")
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
-# ─── Пул соединений: берёт PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE/PGSSLMODE из окружения ───
-pool = AsyncConnectionPool(
-    min_size=1,
-    max_size=5,
-    num_workers=2,
-    timeout=15,
-    max_lifetime=3600,
-    max_idle=300,
-)
+# ─── Пул создаётся позже, внутри main() ───
+pool: AsyncConnectionPool | None = None
 
 # Диагностика окружения (без пароля)
-logging.warning("PG env -> host=%s user=%s db=%s sslmode=%s",
-                os.getenv("PGHOST"), os.getenv("PGUSER"),
-                os.getenv("PGDATABASE"), os.getenv("PGSSLMODE"))
+logging.warning(
+    "PG env -> host=%s user=%s db=%s sslmode=%s",
+    os.getenv("PGHOST"),
+    os.getenv("PGUSER"),
+    os.getenv("PGDATABASE"),
+    os.getenv("PGSSLMODE")
+)
 
 def kb(sid: int, is_booked: bool, free_left: int):
     btns = []
@@ -36,6 +33,7 @@ def kb(sid: int, is_booked: bool, free_left: int):
     if is_booked:
         btns.append(InlineKeyboardButton(text="↩️ Отменить",  callback_data=f"cancel:{sid}"))
     return InlineKeyboardMarkup(inline_keyboard=[btns]) if btns else None
+
 
 async def q1(conn, sql, *args):
     async with conn.cursor() as cur:
@@ -58,13 +56,16 @@ async def ensure_user(conn, tg_id: int, name: str):
     )
     return row[0]
 
+
 @dp.message(CommandStart())
 async def start(m: Message):
     await m.answer("Привет! Запись на теннис.\n• /week — расписание\n• /me — мои записи\n• /rules — правила")
 
+
 @dp.message(Command("rules"))
 async def rules(m: Message):
     await m.answer("Отмена без списания — не позднее чем за 12 часов до начала.")
+
 
 @dp.message(Command("week"))
 async def week(m: Message):
@@ -86,6 +87,7 @@ async def week(m: Message):
         lines.append(f"• #{sid} — {st:%a %d.%m %H:%M} (свободно: {free_left})")
     await m.answer("\n".join(lines))
 
+
 @dp.message(Command("me"))
 async def me(m: Message):
     async with pool.connection() as conn:
@@ -105,6 +107,7 @@ async def me(m: Message):
         lines.append(f"• booking {bid}: {st:%a %d.%m %H:%M} ({kind})")
     await m.answer("\n".join(lines))
 
+
 @dp.message(F.text.startswith("ses_"))
 async def open_by_code(m: Message):
     code = m.text[4:]
@@ -114,6 +117,7 @@ async def open_by_code(m: Message):
         await m.answer("Слот не найден.")
         return
     await open_session(m.from_user.id, m, None, row[0])
+
 
 async def open_session(tg_user_id: int, m: Message|None, c: CallbackQuery|None, sid: int):
     async with pool.connection() as conn:
@@ -137,6 +141,7 @@ async def open_session(tg_user_id: int, m: Message|None, c: CallbackQuery|None, 
     else:
         await c.message.edit_text(text, reply_markup=markup)
 
+
 @dp.callback_query(F.data.startswith("book:"))
 async def cb_book(c: CallbackQuery):
     _, sid, kind = c.data.split(":"); sid = int(sid)
@@ -149,6 +154,7 @@ async def cb_book(c: CallbackQuery):
             msg = str(e)
     await c.answer(msg, show_alert=(msg!="OK"))
     await open_session(c.from_user.id, None, c, sid)
+
 
 @dp.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(c: CallbackQuery):
@@ -165,6 +171,7 @@ async def cb_cancel(c: CallbackQuery):
         msg = (await q1(conn, "SELECT tennis.cancel_booking(%s)", bid))[0]
     await c.answer(msg, show_alert=(msg!="OK"))
     await open_session(c.from_user.id, None, c, sid)
+
 
 # ─── Диагностика подключения к БД ──────────────────────────────
 @dp.message(Command("db"))
@@ -188,12 +195,28 @@ async def db_check(m: Message):
         print(msg, flush=True)
         await m.answer(msg, parse_mode=None)
 
+
 @dp.message(Command("ping"))
 async def ping(m: Message):
     await m.answer("pong")
 
+
 async def main():
+    global pool
     print(">>> Bot container started", flush=True)
+
+    # Создаём пул, но открываем его только внутри запущенного event loop
+    pool = AsyncConnectionPool(
+        min_size=1,
+        max_size=5,
+        num_workers=2,
+        timeout=15,
+        max_lifetime=3600,
+        max_idle=300,
+        open=False,
+    )
+    await pool.open()
+
     try:
         print(">>> Starting polling...", flush=True)
         await dp.start_polling(bot)
@@ -203,9 +226,11 @@ async def main():
         traceback.print_exc()
     finally:
         print(">>> Polling stopped, closing pool...", flush=True)
-        await pool.close()
+        if pool is not None:
+            await pool.close()
         while True:
             await asyncio.sleep(3600)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
