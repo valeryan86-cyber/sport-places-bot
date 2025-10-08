@@ -165,8 +165,25 @@ async def cb_cancel(c: CallbackQuery):
     await open_session(c.from_user.id, None, c, sid)
 
 
-# ─── НАДЁЖНЫЙ КОНЕЦ С KEEP-ALIVE ──────────────────────────────
+# ─── Диагностика подключения к БД ──────────────────────────────
+@dp.message(Command("db"))
+async def db_check(m: Message):
+    try:
+        async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("select version(), now(), current_database();")
+                ver, ts, dbname = await cur.fetchone()
+        await m.answer(
+            f"DB OK ✅\n<code>{dbname}</code>\n{ver}\nnow: {ts:%Y-%m-%d %H:%M:%S %Z}",
+            parse_mode=None
+        )
+    except Exception as e:
+        msg = f"DB ERROR ❌: {type(e).__name__}: {e}"
+        print(msg, flush=True)
+        await m.answer(msg, parse_mode=None)
 
+
+# ─── Конец с keep-alive ──────────────────────────────
 @dp.message(Command("ping"))
 async def ping(m: Message):
     await m.answer("pong")
@@ -177,11 +194,11 @@ async def main():
     try:
         print(">>> Starting polling...", flush=True)
         await dp.start_polling(bot)
+        print(">>> Bot polling started", flush=True)
     except Exception as e:
         print(">>> Unhandled exception in polling:", e, file=sys.stderr, flush=True)
         traceback.print_exc()
     finally:
-        # чтобы Railway не завершал контейнер, если polling остановился
         print(">>> Polling stopped, keeping container alive...", flush=True)
         while True:
             await asyncio.sleep(3600)
