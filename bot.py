@@ -11,6 +11,12 @@ from psycopg import OperationalError
 
 from zoneinfo import ZoneInfo
 
+# ─── Логи ───────────────────────────────────────────────────────
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(levelname)s:%(name)s:%(message)s",
+)
+
 # ─── Базовые переменные ─────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 TIMEZONE  = os.environ.get("TIMEZONE", "Europe/Moscow")
@@ -91,7 +97,7 @@ def kb(sid: int, can_book: bool, can_cancel: bool):
     rows.append(row2)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# ─── SQL helpers (ВАЖНО: prepare=False, чтоб не было prepared stmts) ────────────
+# ─── SQL helpers (ВАЖНО: prepare=False, чтобы PgBouncer не падал) ────────────
 async def q1(conn, sql, *args):
     async with conn.cursor() as cur:
         await cur.execute(sql, args, prepare=False)
@@ -246,6 +252,7 @@ async def open_session(tg_user_id: int, m: Message|None, c: CallbackQuery|None, 
             try:
                 await c.message.edit_text(text, reply_markup=markup)
             except TelegramBadRequest as e:
+                # Игнорируем "message is not modified"
                 if "message is not modified" not in str(e).lower():
                     await safe_alert(c, f"Ошибка показа слота: {e}", show_alert=True)
     except Exception as e:
@@ -375,7 +382,7 @@ async def main():
         timeout=30,
         max_lifetime=3600,
         max_idle=300,
-        open=False,  # без configure — мы и так отключили prepare на execute()
+        open=False,  # без configure: используем prepare=False в execute()
     )
     await pool.open()
 
