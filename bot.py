@@ -55,15 +55,19 @@ def _pg_env_conninfo() -> str:
 
 # ─── UI ─────────────────────────────────────────────────────────
 def kb(sid: int, can_book: bool, can_cancel: bool):
-    row = []
+    row1 = []
     if can_book:
-        row += [
+        row1 += [
             InlineKeyboardButton(text="➕ Разово",    callback_data=f"book:{sid}:single"),
             InlineKeyboardButton(text="✅ Абонемент", callback_data=f"book:{sid}:pass"),
         ]
+    row2 = [InlineKeyboardButton(text="👥 Участники", callback_data=f"who:{sid}")]
     if can_cancel:
-        row.append(InlineKeyboardButton(text="↩️ Отменить", callback_data=f"cancel:{sid}"))
-    return InlineKeyboardMarkup(inline_keyboard=[row]) if row else None
+        row2.append(InlineKeyboardButton(text="↩️ Отменить", callback_data=f"cancel:{sid}"))
+    rows = []
+    if row1: rows.append(row1)
+    rows.append(row2)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ─── SQL helpers ────────────────────────────────────────────────
 async def q1(conn, sql, *args):
@@ -204,7 +208,8 @@ async def open_session(tg_user_id: int, m: Message|None, c: CallbackQuery|None, 
         else:
             _sid, st, en, free_left, cap, is_future, can_cancel_deadline, is_booked = row
             can_book   = bool(is_future and free_left > 0 and not is_booked)
-            can_cancel = bool(is_booked and can_cancel_deadline)
+            # показываем «Отменить» до начала слота (БД сама вернёт сообщение, если дедлайн прошёл)
+            can_cancel = bool(is_future and is_booked)
             text = (
                 f"<b>Слот</b>\n"
                 f"{fmt_dt(st)}–{en.astimezone(TZ):%H:%M}\n"
@@ -222,6 +227,34 @@ async def open_session(tg_user_id: int, m: Message|None, c: CallbackQuery|None, 
             await c.answer(f"Ошибка показа слота: {e}", show_alert=True)
         elif m:
             await m.answer(f"Ошибка показа слота: {e}")
+
+@dp.callback_query(F.data.startswith("who:"))
+async def cb_who(c: CallbackQuery):
+    sid = int(c.data.split(":")[1])
+    try:
+        async with pool.connection() as conn:
+            rows = await qn(conn, """
+                SELECT u.name, b.kind
+                FROM tennis.bookings b
+                JOIN tennis.users u ON u.id = b.user_id
+                WHERE b.session_id=%s AND b.status='booked'
+                ORDER BY u.name
+            """, sid)
+            cap_row = await q1(conn, "SELECT COALESCE(capacity,8) FROM tennis.sessions WHERE id=%s", sid)
+            cap = cap_row[0] if cap_row else 8
+
+        if not rows:
+            await c.answer("Пока никто не записан.", show_alert=True)
+            return
+
+        lines = [f"<b>Участники ({len(rows)}/{cap})</b>"]
+        for name, kind in rows:
+            lines.append(f"• {name} — {kind}")
+        await c.message.reply("\n".join(lines))
+        await c.answer()
+    except Exception as e:
+        logging.exception("who failed (sid=%s): %s", sid, e)
+        await c.answer(f"Ошибка получения списка: {e}", show_alert=True)
 
 @dp.callback_query(F.data.startswith("book:"))
 async def cb_book(c: CallbackQuery):
