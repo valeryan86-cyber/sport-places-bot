@@ -7,13 +7,17 @@ import psycopg
 from psycopg_pool import AsyncConnectionPool
 from psycopg import OperationalError
 
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# ─── Базовые переменные ─────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 TIMEZONE  = os.environ.get("TIMEZONE", "Europe/Moscow")
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
-# ─── Пул создаётся позже, внутри main() ───
+# ─── Пул создаётся позже, внутри main() ────────────────────────
 pool: AsyncConnectionPool | None = None
 
 # Диагностика окружения (без пароля)
@@ -22,24 +26,35 @@ logging.warning(
     os.getenv("PGHOST"),
     os.getenv("PGUSER"),
     os.getenv("PGDATABASE"),
-    os.getenv("PGSSLMODE")
+    os.getenv("PGSSLMODE"),
 )
 
+# ─── Время и форматирование дат ─────────────────────────────────
+TZ = ZoneInfo(TIMEZONE)
+WDAY_RU = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
+
+def fmt_dt(dt):
+    d = dt.astimezone(TZ)
+    # PostgreSQL weekday: Mon=0..Sun=6; мы используем список Пн..Вс
+    return f"{WDAY_RU[d.weekday()]} {d:%d.%m %H:%M}"
+
+# ─── Conninfo из PG* переменных ─────────────────────────────────
 def _pg_env_conninfo() -> str:
-    """Собираем conninfo строго из PG* переменных Railway, без auto-magic libpq."""
+    """Собираем conninfo строго из PG* переменных Railway."""
     host = os.environ["PGHOST"]
     port = os.environ.get("PGPORT", "5432")
     db   = os.environ.get("PGDATABASE", "postgres")
-    user = os.environ["PGUSER"]     # важно: postgres.<projectref>
-    pwd  = os.environ["PGPASSWORD"] # сырой пароль, без percent-encoding
-
-    # Явно задаём SSL и отключаем gssenc; добавляем таймаут соединения
+    user = os.environ["PGUSER"]
+    pwd  = os.environ["PGPASSWORD"]
+    # Добавим безопасные флаги для пулера
     return (
         f"host={host} port={port} dbname={db} "
         f"user={user} password={pwd} "
-        f"sslmode=require gssencmode=disable connect_timeout=10"
+        f"sslmode=require gssencmode=disable channel_binding=disable "
+        f"target_session_attrs=any connect_timeout=10"
     )
 
+# ─── UI ─────────────────────────────────────────────────────────
 def kb(sid: int, is_booked: bool, free_left: int):
     btns = []
     if free_left > 0 and not is_booked:
@@ -49,7 +64,7 @@ def kb(sid: int, is_booked: bool, free_left: int):
         btns.append(InlineKeyboardButton(text="↩️ Отменить",  callback_data=f"cancel:{sid}"))
     return InlineKeyboardMarkup(inline_keyboard=[btns]) if btns else None
 
-
+# ─── SQL helpers ────────────────────────────────────────────────
 async def q1(conn, sql, *args):
     async with conn.cursor() as cur:
         await cur.execute(sql, args)
@@ -71,23 +86,22 @@ async def ensure_user(conn, tg_id: int, name: str):
     )
     return row[0]
 
-
+# ─── Команды ────────────────────────────────────────────────────
 @dp.message(CommandStart())
 async def start(m: Message):
     await m.answer("Привет! Запись на теннис.\n• /week — расписание\n• /me — мои записи\n• /rules — правила")
-
 
 @dp.message(Command("rules"))
 async def rules(m: Message):
     await m.answer("Отмена без списания — не позднее чем за 12 часов до начала.")
 
-
 @dp.message(Command("week"))
 async def week(m: Message):
+    # текущая неделя: [Пн 00:00; Пн 00:00 + 7 дней)
     async with pool.connection() as conn:
         rows = await qn(conn, """
             WITH w AS (SELECT date_trunc('week', now()) AS ws)
-            SELECT s.id, s.starts_at, v.free_left
+            SELECT s.id, s.starts_at, v.free_left, COALESCE(s.capacity, 8) AS cap
             FROM tennis.sessions s
             JOIN tennis.v_session_load v USING(id)
             WHERE s.starts_at >= (SELECT ws FROM w)
@@ -98,10 +112,9 @@ async def week(m: Message):
         await m.answer("На эту неделю слоты ещё не созданы.")
         return
     lines = ["<b>Расписание недели</b>"]
-    for sid, st, free_left in rows:
-        lines.append(f"• #{sid} — {st:%a %d.%m %H:%M} (свободно: {free_left})")
+    for sid, st, free_left, cap in rows:
+        lines.append(f"• #{sid} — {fmt_dt(st)} ({free_left}/{cap})")
     await m.answer("\n".join(lines))
-
 
 @dp.message(Command("me"))
 async def me(m: Message):
@@ -119,9 +132,8 @@ async def me(m: Message):
         return
     lines = ["<b>Мои записи</b>"]
     for bid, st, kind in rows:
-        lines.append(f"• booking {bid}: {st:%a %d.%m %H:%M} ({kind})")
+        lines.append(f"• booking {bid}: {fmt_dt(st)} ({kind})")
     await m.answer("\n".join(lines))
-
 
 @dp.message(F.text.startswith("ses_"))
 async def open_by_code(m: Message):
@@ -133,12 +145,11 @@ async def open_by_code(m: Message):
         return
     await open_session(m.from_user.id, m, None, row[0])
 
-
 async def open_session(tg_user_id: int, m: Message|None, c: CallbackQuery|None, sid: int):
     async with pool.connection() as conn:
         uid = await ensure_user(conn, tg_user_id, (m.from_user if m else c.from_user).full_name)
         row = await q1(conn, """
-            SELECT s.id, s.starts_at, s.ends_at, v.free_left,
+            SELECT s.id, s.starts_at, s.ends_at, v.free_left, COALESCE(s.capacity, 8) AS cap,
                    EXISTS(SELECT 1 FROM tennis.bookings b
                           WHERE b.session_id=s.id AND b.user_id=%s AND b.status='booked') AS is_booked
             FROM tennis.sessions s
@@ -148,14 +159,17 @@ async def open_session(tg_user_id: int, m: Message|None, c: CallbackQuery|None, 
     if not row:
         text, markup = "Слот не найден.", None
     else:
-        _sid, st, en, free_left, is_booked = row
-        text = f"<b>Слот #{_sid}</b>\n{st:%a %d.%m %H:%M}–{en:%H:%M}\nСвободно: {free_left}"
+        _sid, st, en, free_left, cap, is_booked = row
+        text = (
+            f"<b>Слот #{_sid}</b>\n"
+            f"{fmt_dt(st)}–{en.astimezone(TZ):%H:%M}\n"
+            f"Свободно: {free_left} из {cap}"
+        )
         markup = kb(_sid, is_booked, free_left)
     if m:
         await m.answer(text, reply_markup=markup)
     else:
         await c.message.edit_text(text, reply_markup=markup)
-
 
 @dp.callback_query(F.data.startswith("book:"))
 async def cb_book(c: CallbackQuery):
@@ -166,10 +180,9 @@ async def cb_book(c: CallbackQuery):
             async with conn.transaction():
                 msg = (await q1(conn, "SELECT tennis.book_session(%s,%s,%s)", uid, sid, kind))[0]
         except Exception as e:
-            msg = str(e)
-    await c.answer(msg, show_alert=(msg!="OK"))
+            msg = f"Ошибка: {e}"
+    await c.answer("Записано ✅" if msg == "OK" else msg, show_alert=(msg!="OK"))
     await open_session(c.from_user.id, None, c, sid)
-
 
 @dp.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(c: CallbackQuery):
@@ -184,9 +197,8 @@ async def cb_cancel(c: CallbackQuery):
             return
         bid = row[0]
         msg = (await q1(conn, "SELECT tennis.cancel_booking(%s)", bid))[0]
-    await c.answer(msg, show_alert=(msg!="OK"))
+    await c.answer("Отменено ✅" if msg == "OK" else msg, show_alert=(msg!="OK"))
     await open_session(c.from_user.id, None, c, sid)
-
 
 # ─── Диагностика подключения к БД ──────────────────────────────
 @dp.message(Command("db"))
@@ -210,12 +222,11 @@ async def db_check(m: Message):
         print(msg, flush=True)
         await m.answer(msg, parse_mode=None)
 
-
 @dp.message(Command("ping"))
 async def ping(m: Message):
     await m.answer("pong")
 
-
+# ─── Точка входа ────────────────────────────────────────────────
 async def main():
     global pool
     print(">>> Bot container started", flush=True)
@@ -226,11 +237,11 @@ async def main():
 
     # Создаём пул, открываем его уже внутри запущенного event loop
     pool = AsyncConnectionPool(
-        conninfo=conninfo,   # ← явная строка подключения
+        conninfo=conninfo,
         min_size=1,
         max_size=5,
         num_workers=2,
-        timeout=30,          # увеличили, чтобы избежать ложных таймаутов
+        timeout=30,
         max_lifetime=3600,
         max_idle=300,
         open=False,
@@ -250,7 +261,6 @@ async def main():
             await pool.close()
         while True:
             await asyncio.sleep(3600)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
