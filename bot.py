@@ -3,11 +3,12 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest
+
 import psycopg
 from psycopg_pool import AsyncConnectionPool
 from psycopg import OperationalError
 
-from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 # ─── Базовые переменные ─────────────────────────────────────────
@@ -49,9 +50,15 @@ async def safe_alert(c: CallbackQuery, text: str, *, show_alert: bool = True):
     try:
         await c.answer(short, show_alert=show_alert)
     except Exception:
-        await c.answer("Произошла ошибка", show_alert=True)
+        try:
+            await c.answer("Произошла ошибка", show_alert=True)
+        except Exception:
+            pass
     if len(short) < len(str(text)) and show_alert:
-        await c.message.reply(str(text))
+        try:
+            await c.message.reply(str(text))
+        except Exception:
+            pass
 
 # ─── Conninfo из PG* переменных ─────────────────────────────────
 def _pg_env_conninfo() -> str:
@@ -61,6 +68,7 @@ def _pg_env_conninfo() -> str:
     db   = os.environ.get("PGDATABASE", "postgres")
     user = os.environ["PGUSER"]
     pwd  = os.environ["PGPASSWORD"]
+    # никаких prepare_threshold здесь!
     return (
         f"host={host} port={port} dbname={db} "
         f"user={user} password={pwd} "
@@ -69,9 +77,17 @@ def _pg_env_conninfo() -> str:
     )
 
 # ─── Настройка соединения пула (PgBouncer-friendly) ────────────
-async def _configure_conn(conn: psycopg.AsyncConnection):
+async def _configure_conn(conn):
     # отключаем server-side prepares для PgBouncer (txn pooler)
-    conn.prepare_threshold = 0
+    try:
+        conn.prepare_threshold = 0
+    except Exception:
+        # запасной путь: принудительно отключим на сессии
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute("set prepare_threshold = 0;")
+        except Exception:
+            pass
 
 # ─── UI ─────────────────────────────────────────────────────────
 def kb(sid: int, can_book: bool, can_cancel: bool):
@@ -194,7 +210,7 @@ async def me(m: Message):
         await m.answer("У вас нет будущих записей.")
         return
     lines = ["<b>Мои записи</b>"]
-    for bid, st, kind in rows:
+    for _, st, kind in rows:
         lines.append(f"• {fmt_dt(st)} — {kind}")
     await m.answer("\n".join(lines))
 
@@ -237,14 +253,20 @@ async def open_session(tg_user_id: int, m: Message|None, c: CallbackQuery|None, 
                 + ("" if is_future else "\n<b>Запись закрыта: слот уже начался</b>")
             )
             markup = kb(_sid, can_book, can_cancel)
+
         if m:
             await m.answer(text, reply_markup=markup)
         else:
-            await c.message.edit_text(text, reply_markup=markup)
+            try:
+                await c.message.edit_text(text, reply_markup=markup)
+            except TelegramBadRequest as e:
+                # тихо игнорируем «message is not modified», остальное — покажем алертом
+                if "message is not modified" not in str(e).lower():
+                    await safe_alert(c, f"Ошибка показа слота: {e}", show_alert=True)
     except Exception as e:
         logging.exception("open_session error (sid=%s): %s", sid, e)
         if c:
-            await c.answer(f"Ошибка показа слота: {e}", show_alert=True)
+            await safe_alert(c, f"Ошибка показа слота: {e}", show_alert=True)
         elif m:
             await m.answer(f"Ошибка показа слота: {e}")
 
@@ -368,7 +390,7 @@ async def main():
         timeout=30,
         max_lifetime=3600,
         max_idle=300,
-        configure=_configure_conn,   # ← ВАЖНО: отключаем server-side prepares
+        configure=_configure_conn,   # ← отключаем server-side prepares
         open=False,
     )
     await pool.open()
@@ -384,6 +406,7 @@ async def main():
         print(">>> Polling stopped, closing pool...", flush=True)
         if pool is not None:
             await pool.close()
+        # держим воркер живым
         while True:
             await asyncio.sleep(3600)
 
