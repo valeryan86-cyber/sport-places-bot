@@ -35,7 +35,6 @@ WDAY_RU = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
 
 def fmt_dt(dt):
     d = dt.astimezone(TZ)
-    # PostgreSQL weekday: Mon=0..Sun=6; мы используем список Пн..Вс
     return f"{WDAY_RU[d.weekday()]} {d:%d.%m %H:%M}"
 
 # ─── Conninfo из PG* переменных ─────────────────────────────────
@@ -46,7 +45,7 @@ def _pg_env_conninfo() -> str:
     db   = os.environ.get("PGDATABASE", "postgres")
     user = os.environ["PGUSER"]
     pwd  = os.environ["PGPASSWORD"]
-    # Добавим безопасные флаги для пулера
+    # Флаги для пулера Supabase
     return (
         f"host={host} port={port} dbname={db} "
         f"user={user} password={pwd} "
@@ -101,20 +100,53 @@ async def week(m: Message):
     async with pool.connection() as conn:
         rows = await qn(conn, """
             WITH w AS (SELECT date_trunc('week', now()) AS ws)
-            SELECT s.id, s.starts_at, v.free_left, COALESCE(s.capacity, 8) AS cap
+            SELECT s.id,
+                   s.starts_at,
+                   v.free_left,
+                   COALESCE(s.capacity, 8) AS cap
             FROM tennis.sessions s
             JOIN tennis.v_session_load v USING(id)
             WHERE s.starts_at >= (SELECT ws FROM w)
               AND s.starts_at <  (SELECT ws + interval '7 day' FROM w)
+              -- показываем только реальные занятия: Пн/Чт 20:00, Вс 20:00/21:00 (по МСК)
+              AND (
+                    (
+                      extract(dow from (s.starts_at at time zone 'Europe/Moscow')) in (1,4)
+                      AND extract(hour from (s.starts_at at time zone 'Europe/Moscow')) = 20
+                    )
+                 OR (
+                      extract(dow from (s.starts_at at time zone 'Europe/Moscow')) = 0
+                      AND extract(hour from (s.starts_at at time zone 'Europe/Moscow')) in (20,21)
+                    )
+                  )
             ORDER BY s.starts_at
         """)
     if not rows:
         await m.answer("На эту неделю слоты ещё не созданы.")
         return
+
+    # Текст (МСК)
     lines = ["<b>Расписание недели</b>"]
     for sid, st, free_left, cap in rows:
         lines.append(f"• #{sid} — {fmt_dt(st)} ({free_left}/{cap})")
-    await m.answer("\n".join(lines))
+
+    # Инлайн-кнопки “Открыть слот”
+    open_buttons = [
+        InlineKeyboardButton(
+            text=f"#{sid} {st.astimezone(TZ):%d.%m %H:%M} ({free_left}/{cap})",
+            callback_data=f"open:{sid}"
+        )
+        for sid, st, free_left, cap in rows
+    ]
+    kb_rows = [open_buttons[i:i+2] for i in range(0, len(open_buttons), 2)]
+    markup = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    await m.answer("\n".join(lines), reply_markup=markup)
+
+@dp.callback_query(F.data.startswith("open:"))
+async def cb_open(c: CallbackQuery):
+    sid = int(c.data.split(":")[1])
+    await open_session(c.from_user.id, None, c, sid)
 
 @dp.message(Command("me"))
 async def me(m: Message):
