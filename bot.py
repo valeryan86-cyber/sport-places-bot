@@ -37,6 +37,22 @@ def fmt_dt(dt):
     d = dt.astimezone(TZ)
     return f"{WDAY_RU[d.weekday()]} {d:%d.%m %H:%M}"
 
+# ─── Безопасные алерты для Telegram ────────────────────────────
+ALERT_LIMIT = 190  # запас к лимиту телеги ~200
+
+def clip_for_alert(text: str, limit: int = ALERT_LIMIT) -> str:
+    s = str(text)
+    return (s[:limit - 1] + "…") if len(s) > limit else s
+
+async def safe_alert(c: CallbackQuery, text: str, *, show_alert: bool = True):
+    short = clip_for_alert(text)
+    try:
+        await c.answer(short, show_alert=show_alert)
+    except Exception:
+        await c.answer("Произошла ошибка", show_alert=True)
+    if len(short) < len(str(text)) and show_alert:
+        await c.message.reply(str(text))
+
 # ─── Conninfo из PG* переменных ─────────────────────────────────
 def _pg_env_conninfo() -> str:
     """Собираем conninfo строго из PG* переменных Railway."""
@@ -45,12 +61,13 @@ def _pg_env_conninfo() -> str:
     db   = os.environ.get("PGDATABASE", "postgres")
     user = os.environ["PGUSER"]
     pwd  = os.environ["PGPASSWORD"]
-    # Флаги для пулера Supabase
+    # ВАЖНО: prepare_threshold=0 — отключаем server-side prepares для PgBouncer (txn pooler)
     return (
         f"host={host} port={port} dbname={db} "
         f"user={user} password={pwd} "
         f"sslmode=require gssencmode=disable channel_binding=disable "
-        f"target_session_attrs=any connect_timeout=10"
+        f"target_session_attrs=any connect_timeout=10 "
+        f"prepare_threshold=0"
     )
 
 # ─── UI ─────────────────────────────────────────────────────────
@@ -208,7 +225,7 @@ async def open_session(tg_user_id: int, m: Message|None, c: CallbackQuery|None, 
         else:
             _sid, st, en, free_left, cap, is_future, can_cancel_deadline, is_booked = row
             can_book   = bool(is_future and free_left > 0 and not is_booked)
-            # показываем «Отменить» до начала слота (БД сама вернёт сообщение, если дедлайн прошёл)
+            # «Отменить» показываем до начала (БД сама проверит дедлайн)
             can_cancel = bool(is_future and is_booked)
             text = (
                 f"<b>Слот</b>\n"
@@ -267,12 +284,15 @@ async def cb_book(c: CallbackQuery):
                     msg = (await q1(conn, "SELECT tennis.book_session(%s,%s,%s)", uid, sid, kind))[0]
             except Exception as e:
                 logging.exception("book_session error (sid=%s, kind=%s, uid=%s): %s", sid, kind, uid, e)
-                msg = f"Ошибка: {e}"
-        await c.answer("Записано ✅" if msg == "OK" else msg, show_alert=(msg != "OK"))
+                msg = f"Ошибка записи: {e}"
+        if msg == "OK":
+            await c.answer("Записано ✅", show_alert=False)
+        else:
+            await safe_alert(c, msg, show_alert=True)
         await open_session(c.from_user.id, None, c, sid)
     except Exception as e:
         logging.exception("cb_book outer error: %s", e)
-        await c.answer(f"Не удалось записаться: {e}", show_alert=True)
+        await safe_alert(c, f"Не удалось записаться: {e}", show_alert=True)
 
 @dp.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(c: CallbackQuery):
@@ -291,12 +311,15 @@ async def cb_cancel(c: CallbackQuery):
                 msg = (await q1(conn, "SELECT tennis.cancel_booking(%s)", bid))[0]
             except Exception as e:
                 logging.exception("cancel_booking error (bid=%s): %s", bid, e)
-                msg = f"Ошибка: {e}"
-        await c.answer("Отменено ✅" if msg == "OK" else msg, show_alert=(msg != "OK"))
+                msg = f"Ошибка отмены: {e}"
+        if msg == "OK":
+            await c.answer("Отменено ✅", show_alert=False)
+        else:
+            await safe_alert(c, msg, show_alert=True)
         await open_session(c.from_user.id, None, c, sid)
     except Exception as e:
         logging.exception("cb_cancel outer error: %s", e)
-        await c.answer(f"Не удалось отменить: {e}", show_alert=True)
+        await safe_alert(c, f"Не удалось отменить: {e}", show_alert=True)
 
 # ─── Диагностика подключения к БД ──────────────────────────────
 @dp.message(Command("db"))
