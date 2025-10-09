@@ -54,14 +54,16 @@ def _pg_env_conninfo() -> str:
     )
 
 # ─── UI ─────────────────────────────────────────────────────────
-def kb(sid: int, is_booked: bool, free_left: int):
-    btns = []
-    if free_left > 0 and not is_booked:
-        btns.append(InlineKeyboardButton(text="➕ Разово",    callback_data=f"book:{sid}:single"))
-        btns.append(InlineKeyboardButton(text="✅ Абонемент", callback_data=f"book:{sid}:pass"))
-    if is_booked:
-        btns.append(InlineKeyboardButton(text="↩️ Отменить",  callback_data=f"cancel:{sid}"))
-    return InlineKeyboardMarkup(inline_keyboard=[btns]) if btns else None
+def kb(sid: int, can_book: bool, can_cancel: bool):
+    row = []
+    if can_book:
+        row += [
+            InlineKeyboardButton(text="➕ Разово",    callback_data=f"book:{sid}:single"),
+            InlineKeyboardButton(text="✅ Абонемент", callback_data=f"book:{sid}:pass"),
+        ]
+    if can_cancel:
+        row.append(InlineKeyboardButton(text="↩️ Отменить", callback_data=f"cancel:{sid}"))
+    return InlineKeyboardMarkup(inline_keyboard=[row]) if row else None
 
 # ─── SQL helpers ────────────────────────────────────────────────
 async def q1(conn, sql, *args):
@@ -96,7 +98,7 @@ async def rules(m: Message):
 
 @dp.message(Command("week"))
 async def week(m: Message):
-    # текущая неделя: [Пн 00:00; Пн 00:00 + 7 дней)
+    # текущая неделя: [Пн 00:00; Пн 00:00 + 7 дней), только занятия по расписанию и только будущее
     async with pool.connection() as conn:
         rows = await qn(conn, """
             WITH w AS (SELECT date_trunc('week', now()) AS ws)
@@ -108,7 +110,7 @@ async def week(m: Message):
             JOIN tennis.v_session_load v USING(id)
             WHERE s.starts_at >= (SELECT ws FROM w)
               AND s.starts_at <  (SELECT ws + interval '7 day' FROM w)
-              -- показываем только реальные занятия: Пн/Чт 20:00, Вс 20:00/21:00 (по МСК)
+              AND s.starts_at > now()
               AND (
                     (
                       extract(dow from (s.starts_at at time zone 'Europe/Moscow')) in (1,4)
@@ -125,15 +127,15 @@ async def week(m: Message):
         await m.answer("На эту неделю слоты ещё не созданы.")
         return
 
-    # Текст (МСК)
+    # Текст (МСК) без #id
     lines = ["<b>Расписание недели</b>"]
-    for sid, st, free_left, cap in rows:
-        lines.append(f"• #{sid} — {fmt_dt(st)} ({free_left}/{cap})")
+    for _, st, free_left, cap in rows:
+        lines.append(f"• {fmt_dt(st)}  ({free_left}/{cap})")
 
-    # Инлайн-кнопки “Открыть слот”
+    # Инлайн-кнопки “Открыть слот” (без #id)
     open_buttons = [
         InlineKeyboardButton(
-            text=f"#{sid} {st.astimezone(TZ):%d.%m %H:%M} ({free_left}/{cap})",
+            text=f"{st.astimezone(TZ):%d.%m %H:%M} ({free_left}/{cap})",
             callback_data=f"open:{sid}"
         )
         for sid, st, free_left, cap in rows
@@ -146,7 +148,12 @@ async def week(m: Message):
 @dp.callback_query(F.data.startswith("open:"))
 async def cb_open(c: CallbackQuery):
     sid = int(c.data.split(":")[1])
-    await open_session(c.from_user.id, None, c, sid)
+    try:
+        await open_session(c.from_user.id, None, c, sid)
+        await c.answer()  # погасить "крутилку"
+    except Exception as e:
+        logging.exception("open_session failed: %s", e)
+        await c.answer(f"Ошибка открытия слота: {e}", show_alert=True)
 
 @dp.message(Command("me"))
 async def me(m: Message):
@@ -164,7 +171,7 @@ async def me(m: Message):
         return
     lines = ["<b>Мои записи</b>"]
     for bid, st, kind in rows:
-        lines.append(f"• booking {bid}: {fmt_dt(st)} ({kind})")
+        lines.append(f"• {fmt_dt(st)} — {kind}")
     await m.answer("\n".join(lines))
 
 @dp.message(F.text.startswith("ses_"))
@@ -178,59 +185,85 @@ async def open_by_code(m: Message):
     await open_session(m.from_user.id, m, None, row[0])
 
 async def open_session(tg_user_id: int, m: Message|None, c: CallbackQuery|None, sid: int):
-    async with pool.connection() as conn:
-        uid = await ensure_user(conn, tg_user_id, (m.from_user if m else c.from_user).full_name)
-        row = await q1(conn, """
-            SELECT s.id, s.starts_at, s.ends_at, v.free_left, COALESCE(s.capacity, 8) AS cap,
-                   EXISTS(SELECT 1 FROM tennis.bookings b
-                          WHERE b.session_id=s.id AND b.user_id=%s AND b.status='booked') AS is_booked
-            FROM tennis.sessions s
-            JOIN tennis.v_session_load v USING(id)
-            WHERE s.id=%s
-        """, uid, sid)
-    if not row:
-        text, markup = "Слот не найден.", None
-    else:
-        _sid, st, en, free_left, cap, is_booked = row
-        text = (
-            f"<b>Слот #{_sid}</b>\n"
-            f"{fmt_dt(st)}–{en.astimezone(TZ):%H:%M}\n"
-            f"Свободно: {free_left} из {cap}"
-        )
-        markup = kb(_sid, is_booked, free_left)
-    if m:
-        await m.answer(text, reply_markup=markup)
-    else:
-        await c.message.edit_text(text, reply_markup=markup)
+    try:
+        async with pool.connection() as conn:
+            uid = await ensure_user(conn, tg_user_id, (m.from_user if m else c.from_user).full_name)
+            row = await q1(conn, """
+                SELECT s.id, s.starts_at, s.ends_at,
+                       v.free_left, COALESCE(s.capacity, 8) AS cap,
+                       (s.starts_at > now()) AS is_future,
+                       (now() < s.cancel_deadline) AS can_cancel_deadline,
+                       EXISTS(SELECT 1 FROM tennis.bookings b
+                              WHERE b.session_id=s.id AND b.user_id=%s AND b.status='booked') AS is_booked
+                FROM tennis.sessions s
+                JOIN tennis.v_session_load v USING(id)
+                WHERE s.id=%s
+            """, uid, sid)
+        if not row:
+            text, markup = "Слот не найден.", None
+        else:
+            _sid, st, en, free_left, cap, is_future, can_cancel_deadline, is_booked = row
+            can_book   = bool(is_future and free_left > 0 and not is_booked)
+            can_cancel = bool(is_booked and can_cancel_deadline)
+            text = (
+                f"<b>Слот</b>\n"
+                f"{fmt_dt(st)}–{en.astimezone(TZ):%H:%M}\n"
+                f"Свободно: {free_left} из {cap}"
+                + ("" if is_future else "\n<b>Запись закрыта: слот уже начался</b>")
+            )
+            markup = kb(_sid, can_book, can_cancel)
+        if m:
+            await m.answer(text, reply_markup=markup)
+        else:
+            await c.message.edit_text(text, reply_markup=markup)
+    except Exception as e:
+        logging.exception("open_session error (sid=%s): %s", sid, e)
+        if c:
+            await c.answer(f"Ошибка показа слота: {e}", show_alert=True)
+        elif m:
+            await m.answer(f"Ошибка показа слота: {e}")
 
 @dp.callback_query(F.data.startswith("book:"))
 async def cb_book(c: CallbackQuery):
     _, sid, kind = c.data.split(":"); sid = int(sid)
-    async with pool.connection() as conn:
-        uid = await ensure_user(conn, c.from_user.id, c.from_user.full_name)
-        try:
-            async with conn.transaction():
-                msg = (await q1(conn, "SELECT tennis.book_session(%s,%s,%s)", uid, sid, kind))[0]
-        except Exception as e:
-            msg = f"Ошибка: {e}"
-    await c.answer("Записано ✅" if msg == "OK" else msg, show_alert=(msg!="OK"))
-    await open_session(c.from_user.id, None, c, sid)
+    try:
+        async with pool.connection() as conn:
+            uid = await ensure_user(conn, c.from_user.id, c.from_user.full_name)
+            try:
+                async with conn.transaction():
+                    msg = (await q1(conn, "SELECT tennis.book_session(%s,%s,%s)", uid, sid, kind))[0]
+            except Exception as e:
+                logging.exception("book_session error (sid=%s, kind=%s, uid=%s): %s", sid, kind, uid, e)
+                msg = f"Ошибка: {e}"
+        await c.answer("Записано ✅" if msg == "OK" else msg, show_alert=(msg != "OK"))
+        await open_session(c.from_user.id, None, c, sid)
+    except Exception as e:
+        logging.exception("cb_book outer error: %s", e)
+        await c.answer(f"Не удалось записаться: {e}", show_alert=True)
 
 @dp.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(c: CallbackQuery):
     sid = int(c.data.split(":")[1])
-    async with pool.connection() as conn:
-        uid = await ensure_user(conn, c.from_user.id, c.from_user.full_name)
-        row = await q1(conn,
-            "SELECT id FROM tennis.bookings WHERE user_id=%s AND session_id=%s AND status='booked'",
-            uid, sid)
-        if not row:
-            await c.answer("У вас нет активной записи.", show_alert=True)
-            return
-        bid = row[0]
-        msg = (await q1(conn, "SELECT tennis.cancel_booking(%s)", bid))[0]
-    await c.answer("Отменено ✅" if msg == "OK" else msg, show_alert=(msg!="OK"))
-    await open_session(c.from_user.id, None, c, sid)
+    try:
+        async with pool.connection() as conn:
+            uid = await ensure_user(conn, c.from_user.id, c.from_user.full_name)
+            row = await q1(conn,
+                "SELECT id FROM tennis.bookings WHERE user_id=%s AND session_id=%s AND status='booked'",
+                uid, sid)
+            if not row:
+                await c.answer("У вас нет активной записи.", show_alert=True)
+                return
+            bid = row[0]
+            try:
+                msg = (await q1(conn, "SELECT tennis.cancel_booking(%s)", bid))[0]
+            except Exception as e:
+                logging.exception("cancel_booking error (bid=%s): %s", bid, e)
+                msg = f"Ошибка: {e}"
+        await c.answer("Отменено ✅" if msg == "OK" else msg, show_alert=(msg != "OK"))
+        await open_session(c.from_user.id, None, c, sid)
+    except Exception as e:
+        logging.exception("cb_cancel outer error: %s", e)
+        await c.answer(f"Не удалось отменить: {e}", show_alert=True)
 
 # ─── Диагностика подключения к БД ──────────────────────────────
 @dp.message(Command("db"))
