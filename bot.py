@@ -68,26 +68,12 @@ def _pg_env_conninfo() -> str:
     db   = os.environ.get("PGDATABASE", "postgres")
     user = os.environ["PGUSER"]
     pwd  = os.environ["PGPASSWORD"]
-    # никаких prepare_threshold здесь!
     return (
         f"host={host} port={port} dbname={db} "
         f"user={user} password={pwd} "
         f"sslmode=require gssencmode=disable channel_binding=disable "
         f"target_session_attrs=any connect_timeout=10"
     )
-
-# ─── Настройка соединения пула (PgBouncer-friendly) ────────────
-async def _configure_conn(conn):
-    # отключаем server-side prepares для PgBouncer (txn pooler)
-    try:
-        conn.prepare_threshold = 0
-    except Exception:
-        # запасной путь: принудительно отключим на сессии
-        try:
-            async with conn.cursor() as cur:
-                await cur.execute("set prepare_threshold = 0;")
-        except Exception:
-            pass
 
 # ─── UI ─────────────────────────────────────────────────────────
 def kb(sid: int, can_book: bool, can_cancel: bool):
@@ -105,15 +91,15 @@ def kb(sid: int, can_book: bool, can_cancel: bool):
     rows.append(row2)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# ─── SQL helpers ────────────────────────────────────────────────
+# ─── SQL helpers (ВАЖНО: prepare=False, чтоб не было prepared stmts) ────────────
 async def q1(conn, sql, *args):
     async with conn.cursor() as cur:
-        await cur.execute(sql, args)
+        await cur.execute(sql, args, prepare=False)
         return await cur.fetchone()
 
 async def qn(conn, sql, *args):
     async with conn.cursor() as cur:
-        await cur.execute(sql, args)
+        await cur.execute(sql, args, prepare=False)
         return await cur.fetchall()
 
 async def ensure_user(conn, tg_id: int, name: str):
@@ -260,7 +246,6 @@ async def open_session(tg_user_id: int, m: Message|None, c: CallbackQuery|None, 
             try:
                 await c.message.edit_text(text, reply_markup=markup)
             except TelegramBadRequest as e:
-                # тихо игнорируем «message is not modified», остальное — покажем алертом
                 if "message is not modified" not in str(e).lower():
                     await safe_alert(c, f"Ошибка показа слота: {e}", show_alert=True)
     except Exception as e:
@@ -353,7 +338,7 @@ async def db_check(m: Message):
         async with pool.connection() as conn:
             info = conn.info
             async with conn.cursor() as cur:
-                await cur.execute("select version(), now(), current_database();")
+                await cur.execute("select version(), now(), current_database();", prepare=False)
                 ver, ts, dbname = await cur.fetchone()
         await m.answer(
             "Connecting as:\n"
@@ -390,8 +375,7 @@ async def main():
         timeout=30,
         max_lifetime=3600,
         max_idle=300,
-        configure=_configure_conn,   # ← отключаем server-side prepares
-        open=False,
+        open=False,  # без configure — мы и так отключили prepare на execute()
     )
     await pool.open()
 
