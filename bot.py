@@ -61,14 +61,17 @@ def _pg_env_conninfo() -> str:
     db   = os.environ.get("PGDATABASE", "postgres")
     user = os.environ["PGUSER"]
     pwd  = os.environ["PGPASSWORD"]
-    # ВАЖНО: prepare_threshold=0 — отключаем server-side prepares для PgBouncer (txn pooler)
     return (
         f"host={host} port={port} dbname={db} "
         f"user={user} password={pwd} "
         f"sslmode=require gssencmode=disable channel_binding=disable "
-        f"target_session_attrs=any connect_timeout=10 "
-        f"prepare_threshold=0"
+        f"target_session_attrs=any connect_timeout=10"
     )
+
+# ─── Настройка соединения пула (PgBouncer-friendly) ────────────
+def _configure_conn(conn: psycopg.AsyncConnection):
+    # Отключаем server-side prepares, чтобы не ловить "prepared statement ... already exists"
+    conn.prepare_threshold = 0
 
 # ─── UI ─────────────────────────────────────────────────────────
 def kb(sid: int, can_book: bool, can_cancel: bool):
@@ -365,6 +368,7 @@ async def main():
         timeout=30,
         max_lifetime=3600,
         max_idle=300,
+        configure=_configure_conn,   # ← ВАЖНО: отключаем server-side prepares
         open=False,
     )
     await pool.open()
