@@ -69,8 +69,8 @@ def _pg_env_conninfo() -> str:
     )
 
 # ─── Настройка соединения пула (PgBouncer-friendly) ────────────
-def _configure_conn(conn: psycopg.AsyncConnection):
-    # Отключаем server-side prepares, чтобы не ловить "prepared statement ... already exists"
+async def _configure_conn(conn: psycopg.AsyncConnection):
+    # отключаем server-side prepares для PgBouncer (txn pooler)
     conn.prepare_threshold = 0
 
 # ─── UI ─────────────────────────────────────────────────────────
