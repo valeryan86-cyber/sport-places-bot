@@ -25,6 +25,21 @@ logging.warning(
     os.getenv("PGSSLMODE")
 )
 
+def _pg_env_conninfo() -> str:
+    """Собираем conninfo строго из PG* переменных Railway, без auto-magic libpq."""
+    host = os.environ["PGHOST"]
+    port = os.environ.get("PGPORT", "5432")
+    db   = os.environ.get("PGDATABASE", "postgres")
+    user = os.environ["PGUSER"]     # важно: postgres.<projectref>
+    pwd  = os.environ["PGPASSWORD"] # сырой пароль, без percent-encoding
+
+    # Явно задаём SSL и отключаем gssenc; добавляем таймаут соединения
+    return (
+        f"host={host} port={port} dbname={db} "
+        f"user={user} password={pwd} "
+        f"sslmode=require gssencmode=disable connect_timeout=10"
+    )
+
 def kb(sid: int, is_booked: bool, free_left: int):
     btns = []
     if free_left > 0 and not is_booked:
@@ -205,12 +220,17 @@ async def main():
     global pool
     print(">>> Bot container started", flush=True)
 
-    # Создаём пул, но открываем его только внутри запущенного event loop
+    conninfo = _pg_env_conninfo()
+    masked = conninfo.replace(f"password={os.environ.get('PGPASSWORD', '')}", "password=***")
+    print(f">>> Using conninfo: {masked}", flush=True)
+
+    # Создаём пул, открываем его уже внутри запущенного event loop
     pool = AsyncConnectionPool(
+        conninfo=conninfo,   # ← явная строка подключения
         min_size=1,
         max_size=5,
         num_workers=2,
-        timeout=15,
+        timeout=30,          # увеличили, чтобы избежать ложных таймаутов
         max_lifetime=3600,
         max_idle=300,
         open=False,
